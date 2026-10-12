@@ -1,4 +1,4 @@
-# Call Transcriber: Live Transcripts of Both Sides of a Call on macOS
+# Call Transcriber: Live Transcripts of Both Sides of a Call on macOS and Windows
 
 Put [Claude Code](https://claude.com/claude-code) on your calls. This tool streams a live transcript of both sides of a Zoom, Meet or Teams call to a file. Claude reads it as the call happens and does the work behind the scenes: it looks things up, answers questions, sets things up and keeps your notes, so you don't have to say "let me get back to you."
 
@@ -57,7 +57,7 @@ A single mixed recording has to guess who is speaking, and those guesses swap mi
 
 ## Requirements
 
-- macOS 14.2 or later (for Core Audio process taps).
+- macOS 14.2 or later (for Core Audio process taps), or Windows 10 or 11 (see [Windows](#windows); there the next two items aren't needed).
 - [uv](https://docs.astral.sh/uv/) to run the script and its one dependency.
 - `ffmpeg`: `brew install ffmpeg`.
 - The Swift compiler from the Xcode command line tools: `xcode-select --install`. The audio tap helper builds itself on first `start` into `audiotap/build/`.
@@ -108,6 +108,30 @@ Every `start` writes a new file, such as `~/call-transcripts/2026-10-07_1347_acm
 
 The transcript folder is in your home directory on purpose. Inside a repo, call content could get committed. Under `~/Documents`, iCloud Desktop & Documents sync would upload it. The tool makes the folder readable by your account only.
 
+## Windows
+
+The same commands work on Windows 10 and 11. [`wintap/wintap.py`](wintap/wintap.py) stands in for the Swift tap: it captures your microphone as `Me` and, through WASAPI loopback, whatever the PC plays as `Them`. It streams both in the format `audiotap` uses, so everything after capture (engines, echo removal, the transcript) is shared. ffmpeg and Xcode aren't needed; its two packages, `pyaudiowpatch` and `numpy`, install through the script's dependency header on Windows only.
+
+1. Allow microphone access in **Settings → Privacy & security → Microphone**, including **Let desktop apps access your microphone**. Capturing what the PC plays needs no permission.
+2. Check both sides work, from PowerShell:
+
+   ```powershell
+   uv run call_transcriber.py start --name test
+   Add-Type -AssemblyName System.Speech
+   (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("Transcriber check")   # should appear as a Them line
+   uv run call_transcriber.py status
+   uv run call_transcriber.py stop
+   ```
+
+To use a microphone other than the default, list them with `uv run wintap/wintap.py --list` and pass part of a name to `--device`, such as `--device Headset`. If the default output or microphone changes during a call (headphones plugged in, a Bluetooth headset connecting), the capture restarts on the new device by itself.
+
+Differences from macOS:
+
+- `latest.txt` is a hard link rather than a symlink, because symlinks need administrator rights on Windows. It still follows the current call: `Get-Content -Wait -Tail 0 ~\call-transcripts\latest.txt`.
+- The transcript folder is limited to your account with `icacls`. Keep it out of folders that OneDrive syncs (Desktop and Documents often are), for the same reason the macOS default avoids iCloud.
+- `stop` asks the background process to finish through a file in `.state\` (Windows can't deliver SIGTERM to it), then ends anything left after 5 seconds with `taskkill`.
+- `--tap-app` is macOS only for now. Windows has a per-process loopback API, but using it needs native code.
+
 ## Use It with Claude Code
 
 The [`transcribing-live-calls`](skills/transcribing-live-calls/SKILL.md) skill teaches Claude Code to start and stop the transcriber, watch the transcript as it grows, and keep a notes doc updated during the call. It quotes the speaker and time for every note, marks questions as answered, and never adds anything the transcript doesn't say.
@@ -116,6 +140,12 @@ Install it by linking it into your skills folder. A link rather than a copy lets
 
 ```bash
 ln -s "$PWD/skills/transcribing-live-calls" ~/.claude/skills/transcribing-live-calls
+```
+
+On Windows, a directory junction does the same without administrator rights:
+
+```powershell
+New-Item -ItemType Junction -Path "$HOME\.claude\skills\transcribing-live-calls" -Target "$PWD\skills\transcribing-live-calls"
 ```
 
 Then, before a call, tell Claude something like:
@@ -185,7 +215,7 @@ Lines land later than with Deepgram, by however long the phrase takes to transcr
 - If you read the other side's words back ("so that's 555-010-0199?"), your line can be dropped as echo. Their original line is kept. Headphones avoid echo entirely.
 - Without `--tap-app`, `Them` includes every sound the Mac plays.
 - Diarization labels on the `Them` side are a best guess and can swap mid-call. The `whisper` engine does not split the far side into speakers at all.
-- macOS only. The `Them` side depends on Core Audio process taps.
+- On Windows, `--tap-app` isn't supported yet, so `Them` is everything the PC plays.
 
 ## Recording Consent
 
