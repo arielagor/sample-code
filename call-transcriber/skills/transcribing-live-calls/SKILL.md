@@ -1,6 +1,6 @@
 ---
 name: transcribing-live-calls
-description: Runs the local live call transcriber (call_transcriber.py) that writes a Me/Them transcript of a Zoom, Meet, Teams or phone call on this Mac to a new file per call under ~/call-transcripts/, and keeps a doc of decisions, open questions and follow-ups updated from it while the call is happening. Use whenever the user wants to transcribe a call live, start or stop the transcriber, take live notes or update a doc during a meeting, watch the call transcript, or asks why the transcriber is silent, echoing, or mislabeling speakers. Not for analyzing a finished recording afterwards.
+description: Runs the local live call transcriber (call_transcriber.py) that writes a Me/Them transcript of a Zoom, Meet, Teams or phone call on this Mac or Windows PC to a new file per call under ~/call-transcripts/, and keeps a doc of decisions, open questions and follow-ups updated from it while the call is happening. Use whenever the user wants to transcribe a call live, start or stop the transcriber, take live notes or update a doc during a meeting, watch the call transcript, or asks why the transcriber is silent, echoing, or mislabeling speakers. Not for analyzing a finished recording afterwards.
 ---
 
 # Transcribing live calls
@@ -45,7 +45,10 @@ at the newest; the log is `~/call-transcripts/.state/transcriber.log`.
 4. If this is the first run on this Mac or terminal, check the `Them` side hears
    anything: run `say "transcriber check"` and confirm a `Them:` line appears. A
    silent `Them` side means the terminal app lacks **System Audio Recording Only**
-   permission (README, Setup). macOS shows no error in that case.
+   permission (README, Setup). macOS shows no error in that case. On Windows, play
+   the check with `(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak("transcriber check")`
+   after `Add-Type -AssemblyName System.Speech`. There is no permission for that side;
+   a silent `Me` side means microphone access is off for desktop apps (README, Windows).
 
 ## Watching the transcript
 
@@ -92,7 +95,8 @@ another doc:
 ## After the call
 
 `stop`, then confirm with `pgrep -fl 'call_transcriber|audiotap'` that nothing is
-left. Tell the user the transcript's path; it stays as the record of the call.
+left. On Windows: `Get-CimInstance Win32_Process -Filter "name='python.exe'" | ? CommandLine -match 'call_transcriber|wintap'`
+should return nothing. Tell the user the transcript's path; it stays as the record of the call.
 
 ## Troubleshooting
 
