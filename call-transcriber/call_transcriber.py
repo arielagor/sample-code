@@ -345,7 +345,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         cmd.append("--mic-only")
     logfile = state_dir(args.out_dir) / "transcriber.log"
     # `uv run --with <package>` adds packages through a temporary environment that uv
-    # deletes as soon as start returns, so pass the run process this import path directly.
+    # deletes as soon as start returns, so start the run process from the base
+    # interpreter and pass it this import path directly.
+    cmd[0] = getattr(sys, "_base_executable", sys.executable)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p and os.path.isdir(p)))
     with open(logfile, "a") as logf:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
