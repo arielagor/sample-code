@@ -61,7 +61,7 @@ A single mixed recording has to guess who is speaking, and those guesses swap mi
 - [uv](https://docs.astral.sh/uv/) to run the script and its one dependency.
 - `ffmpeg`: `brew install ffmpeg`.
 - The Swift compiler from the Xcode command line tools: `xcode-select --install`. The audio tap helper builds itself on first `start` into `audiotap/build/`.
-- A [Deepgram](https://deepgram.com) API key for the default engine, or [your own engine](#adding-a-speech-to-text-engine).
+- A [Deepgram](https://deepgram.com) API key for the default engine, or no key at all with the [local Whisper engine](#local-whisper-no-api-key), or [your own engine](#adding-a-speech-to-text-engine).
 
 ## Setup
 
@@ -104,7 +104,7 @@ Every `start` writes a new file, such as `~/call-transcripts/2026-10-07_1347_acm
 | `--device` | The microphone, by name. Default is the system input. List them with `ffmpeg -f avfoundation -list_devices true -i ""`. |
 | `--tap-app` | Capture only one app's audio, by bundle ID prefix, such as `us.zoom`. Default is everything the Mac plays, notification sounds included. |
 | `--mic-only` | Skip the call audio. |
-| `--engine` | The speech-to-text engine. Default `deepgram`. |
+| `--engine` | The speech-to-text engine: `deepgram` (default) or `whisper`. |
 
 The transcript folder is in your home directory on purpose. Inside a repo, call content could get committed. Under `~/Documents`, iCloud Desktop & Documents sync would upload it. The tool makes the folder readable by your account only.
 
@@ -161,13 +161,30 @@ class Session:
 
 Then run with `--engine <file name>`. If your engine needs packages beyond `websockets`, add them with `uv run --with <package> call_transcriber.py start --engine <name>` or to the script's inline dependency header.
 
-**Example: local Whisper.** A local engine (for example with `faster-whisper` or `mlx-whisper`) keeps audio on your Mac. `send` appends PCM to a buffer. `results` waits for a pause in speech, using a voice activity detector or a simple energy threshold, transcribes the buffered phrase in a worker thread so the event loop keeps receiving audio, and yields one `Utterance` per phrase with `started` set to the wall-clock time the phrase began. Whisper has no streaming diarization, so return speaker `0`. Contributions are welcome.
+### Local Whisper (No API Key)
+
+[`engines/whisper.py`](engines/whisper.py) runs [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on your own machine, so audio never leaves it and there is no account or key. It needs one extra package, added at run time:
+
+```bash
+uv run --with faster-whisper call_transcriber.py start --engine whisper --name test
+```
+
+The model downloads on first use. Whisper is not a streaming model, so the engine finds phrases itself: a phrase starts when the audio rises above the room's noise level and ends after half a second of quiet. Each phrase is transcribed in a worker thread while audio keeps arriving, and Whisper's voice activity filter and no-speech score drop the text it would otherwise invent for silence ("Thank you.").
+
+| Variable | What it does |
+|---|---|
+| `WHISPER_MODEL` | Default `small.en`. On a 14-core laptop CPU, `small.en` transcribed a 7.6-second phrase in 2.6 seconds and `base.en` in 1.0, both word-perfect. Use `base.en` or `tiny.en` on slower machines. |
+| `WHISPER_DEVICE` | Default `auto`: an NVIDIA GPU through CUDA if there is one, otherwise the CPU. |
+| `WHISPER_COMPUTE` | Default `int8`. |
+| `WHISPER_LANGUAGE` | Default `en`. Set it empty to auto-detect, with a multilingual model such as `small`. |
+
+Lines land later than with Deepgram, by however long the phrase takes to transcribe. Whisper has no streaming diarization, so every far-side voice is `Them`.
 
 ## Known Limits
 
 - If you read the other side's words back ("so that's 555-010-0199?"), your line can be dropped as echo. Their original line is kept. Headphones avoid echo entirely.
 - Without `--tap-app`, `Them` includes every sound the Mac plays.
-- Diarization labels on the `Them` side are a best guess and can swap mid-call.
+- Diarization labels on the `Them` side are a best guess and can swap mid-call. The `whisper` engine does not split the far side into speakers at all.
 - macOS only. The `Them` side depends on Core Audio process taps.
 
 ## Recording Consent
