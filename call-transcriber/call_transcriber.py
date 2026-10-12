@@ -410,8 +410,11 @@ def cmd_start(args: argparse.Namespace) -> None:
         detach = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
     else:
         detach = {"start_new_session": True}
+    # `uv run --with <package>` adds packages through a temporary environment that uv
+    # deletes as soon as start returns, so pass the run process this import path directly.
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p and os.path.isdir(p)))
     with open(logfile, "a", encoding="utf-8") as logf:
-        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env,
                                 stdin=subprocess.DEVNULL, **detach)
     (state_dir(args.out_dir) / "transcriber.pid").write_text(str(proc.pid))
     print(f"started (pid {proc.pid})")
