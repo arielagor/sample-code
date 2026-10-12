@@ -3,14 +3,17 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "websockets>=13",
+#     "numpy; sys_platform == 'win32'",
+#     "pyaudiowpatch; sys_platform == 'win32'",
 # ]
 # ///
-"""Live call transcriber for macOS: your mic + the call audio -> a text file.
+"""Live call transcriber for macOS and Windows: your mic + the call audio -> a text file.
 
 Two independent streams, each with its own reconnect loop:
-  Me   - your microphone, captured by ffmpeg
+  Me   - your microphone, captured by ffmpeg (on Windows, by the wintap helper)
   Them - whatever the Mac plays (the Zoom, Meet or Teams call), captured by the
-         audiotap helper with a Core Audio process tap
+         audiotap helper with a Core Audio process tap. On Windows, wintap captures
+         what the PC plays with WASAPI loopback.
 
 On laptop speakers the mic also hears the far side, so a Me line that repeats a
 nearby Them line is dropped as echo. Lines are held briefly so that check can run
@@ -51,6 +54,8 @@ import engines  # noqa: E402
 
 TAP_SRC = APP_DIR / "audiotap"
 TAP_BIN = TAP_SRC / "build" / "audiotap"
+WINDOWS = sys.platform == "win32"
+WINTAP = APP_DIR / "wintap" / "wintap.py"
 # In the home folder, not a repo (call content could get committed) and not
 # ~/Documents (iCloud Desktop & Documents sync would upload it).
 DEFAULT_OUT_DIR = Path.home() / "call-transcripts"
@@ -72,7 +77,7 @@ def load_dotenv() -> None:
     path = APP_DIR / ".env"
     if not path.is_file():
         return
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip().removeprefix("export ")
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -266,30 +271,47 @@ class Stream:
 
 async def transcribe(args: argparse.Namespace) -> None:
     engine = engines.load(args.engine)
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        sys.exit("ffmpeg not found: brew install ffmpeg")
-    streams = [Stream("Me", MIC_RATE, diarize=False, engine=engine, cmd=[
-        ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-f", "avfoundation", "-i", f":{args.device}",
-        "-ac", "1", "-ar", str(MIC_RATE), "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])]
-    if not args.mic_only:
-        cmd = [str(build_tap())] + (["--app", args.tap_app] if args.tap_app else [])
-        streams.append(Stream("Them", None, diarize=True, engine=engine, cmd=cmd))
+    if WINDOWS:
+        # wintap reports each device's own rate, like audiotap does for the Them side.
+        mic = [] if args.device == DEFAULT_DEVICE else [args.device]
+        streams = [Stream("Me", None, diarize=False, engine=engine,
+                          cmd=[sys.executable, str(WINTAP), "--mic", *mic])]
+        if not args.mic_only:
+            streams.append(Stream("Them", None, diarize=True, engine=engine,
+                                  cmd=[sys.executable, str(WINTAP), "--loopback"]))
+    else:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            sys.exit("ffmpeg not found: brew install ffmpeg")
+        streams = [Stream("Me", MIC_RATE, diarize=False, engine=engine, cmd=[
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-f", "avfoundation", "-i", f":{args.device}",
+            "-ac", "1", "-ar", str(MIC_RATE), "-f", "s16le", "-acodec", "pcm_s16le", "pipe:1"])]
+        if not args.mic_only:
+            cmd = [str(build_tap())] + (["--app", args.tap_app] if args.tap_app else [])
+            streams.append(Stream("Them", None, diarize=True, engine=engine, cmd=cmd))
 
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
+    if WINDOWS:
+        # No signal handlers on the Windows event loop, and a background process can't
+        # be sent SIGTERM; `stop` asks it to finish by creating a stop file instead.
+        signal.signal(signal.SIGINT, lambda *_: loop.call_soon_threadsafe(stop.set))
+    else:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+    stop_file = state_dir(args.out_dir) / "stop"
 
     transcript = args.transcript or new_transcript(args.out_dir, args.name)
     log(f"transcript: {transcript} (engine: {engine.name})")
-    with open(transcript, "a", buffering=1) as out:
+    with open(transcript, "a", buffering=1, encoding="utf-8") as out:
         writer = Writer(out)
 
         async def flusher():
             while not stop.is_set():
                 writer.flush()
+                if WINDOWS and stop_file.exists():
+                    stop.set()
                 await asyncio.sleep(0.25)
 
         await asyncio.gather(flusher(), *(s.run(writer, stop) for s in streams))
@@ -306,7 +328,13 @@ def state_dir(out_dir: Path) -> Path:
 def new_transcript(out_dir: Path, name: str | None) -> Path:
     """A fresh file for this call; latest.txt is repointed at it."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.chmod(0o700)  # call content: readable by this account only
+    # call content: readable by this account only
+    if WINDOWS:
+        subprocess.run(["icacls", str(out_dir), "/inheritance:r", "/grant:r",
+                        f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        out_dir.chmod(0o700)
     slug = "_" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") if name else ""
     now = datetime.datetime.now()
     path = out_dir / f"{now:%Y-%m-%d_%H%M}{slug}.txt"
@@ -315,18 +343,49 @@ def new_transcript(out_dir: Path, name: str | None) -> Path:
     path.touch()
     latest = out_dir / "latest.txt"
     latest.unlink(missing_ok=True)
-    latest.symlink_to(path.name)
+    if WINDOWS:
+        os.link(path, latest)  # symlinks need admin rights on Windows; a hard link doesn't
+    else:
+        latest.symlink_to(path.name)
     return path
+
+
+def latest_transcript(out_dir: Path) -> Path | None:
+    latest = out_dir / "latest.txt"
+    if not latest.exists():
+        return None
+    if WINDOWS:  # a hard link has no target to resolve; the newest call's file is it
+        return max(out_dir.glob("[0-9]*.txt"), default=latest)
+    return latest.resolve()
+
+
+def alive(pid: int) -> bool:
+    if not WINDOWS:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    # On Windows os.kill(pid, 0) would terminate the process, so ask the kernel instead.
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    code = ctypes.c_ulong()
+    try:
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def running_pid(out_dir: Path) -> int | None:
     pidfile = state_dir(out_dir) / "transcriber.pid"
     try:
         pid = int(pidfile.read_text())
-        os.kill(pid, 0)
-        return pid
     except (OSError, ValueError):
         return None
+    return pid if alive(pid) else None
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -334,9 +393,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"already running (pid {pid})")
         return
     engines.load(args.engine)  # fail here on missing keys, not silently in the background
-    if not args.mic_only:
+    if not args.mic_only and not WINDOWS:
         build_tap()
     transcript = new_transcript(args.out_dir, args.name)
+    (state_dir(args.out_dir) / "stop").unlink(missing_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "run", "--engine", args.engine,
            "--out-dir", str(args.out_dir), "--device", args.device, "--transcript", str(transcript)]
     if args.tap_app:
@@ -344,9 +404,15 @@ def cmd_start(args: argparse.Namespace) -> None:
     if args.mic_only:
         cmd.append("--mic-only")
     logfile = state_dir(args.out_dir) / "transcriber.log"
-    with open(logfile, "a") as logf:
+    if WINDOWS:
+        # A hidden console of its own (no window, survives the terminal closing) that
+        # the capture helpers inherit.
+        detach = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        detach = {"start_new_session": True}
+    with open(logfile, "a", encoding="utf-8") as logf:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+                                stdin=subprocess.DEVNULL, **detach)
     (state_dir(args.out_dir) / "transcriber.pid").write_text(str(proc.pid))
     print(f"started (pid {proc.pid})")
     print(f"transcript: {transcript}")
@@ -358,24 +424,31 @@ def cmd_stop(args: argparse.Namespace) -> None:
     if not pid:
         print("not running")
         return
-    os.kill(pid, signal.SIGTERM)
+    stop_file = state_dir(args.out_dir) / "stop"
+    if WINDOWS:
+        stop_file.touch()  # run sees it within 0.25 s, flushes the last lines and exits
+    else:
+        os.kill(pid, signal.SIGTERM)
     for _ in range(50):
         time.sleep(0.1)
         if running_pid(args.out_dir) is None:
             break
     else:
-        os.killpg(pid, signal.SIGKILL)  # its own session: takes ffmpeg and the tap too
+        if WINDOWS:  # /T takes the capture helpers too
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            os.killpg(pid, signal.SIGKILL)  # its own session: takes ffmpeg and the tap too
     (state_dir(args.out_dir) / "transcriber.pid").unlink(missing_ok=True)
+    stop_file.unlink(missing_ok=True)
     print("stopped")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
     pid = running_pid(args.out_dir)
     print(f"running (pid {pid})" if pid else "not running")
-    latest = args.out_dir / "latest.txt"
-    if latest.exists():
-        transcript = latest.resolve()
-        lines = transcript.read_text().splitlines()
+    if transcript := latest_transcript(args.out_dir):
+        lines = transcript.read_text(encoding="utf-8").splitlines()
         print(f"transcript: {transcript} ({len(lines)} lines)")
         for line in lines[-3:]:
             print(f"  {line}")
@@ -395,6 +468,11 @@ def main() -> None:
     parser.add_argument("--mic-only", action="store_true", help="skip the call-audio tap; mic only")
     args = parser.parse_args()
     args.out_dir = args.out_dir.expanduser()
+    if WINDOWS:
+        if args.tap_app:
+            sys.exit("--tap-app is macOS only for now; on Windows, Them is everything the PC plays")
+        # The log and console get device names and speech in any language.
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     load_dotenv()
     if args.command == "run":
         asyncio.run(transcribe(args))
